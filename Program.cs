@@ -21,14 +21,24 @@ try
     // Get connection string
     string? connectionString = configuration.GetConnectionString("DefaultConnection");
     
-    if (string.IsNullOrEmpty(connectionString) || connectionString.Contains("YOUR_"))
+    if (string.IsNullOrEmpty(connectionString))
     {
         Console.ForegroundColor = ConsoleColor.Red;
         Console.WriteLine("? ERROR: Connection string not configured!");
         Console.ResetColor();
         Console.WriteLine();
-        Console.WriteLine("Please update the connection string in appsettings.json");
-        Console.WriteLine("File location: appsettings.json");
+        Console.WriteLine("Please create a 'secrets.json' file in the project root with your connection string:");
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("secrets.json content:");
+        Console.WriteLine("{");
+        Console.WriteLine("  \"ConnectionStrings\": {");
+        Console.WriteLine("    \"DefaultConnection\": \"Server=YOUR_SERVER;Database=YOUR_DATABASE;User Id=YOUR_USER;Password=YOUR_PASSWORD;...\"");
+        Console.WriteLine("  }");
+        Console.WriteLine("}");
+        Console.ResetColor();
+        Console.WriteLine();
+        Console.WriteLine("Note: secrets.json is already in .gitignore and won't be committed to Git.");
         Console.WriteLine();
         Console.WriteLine("Press any key to exit...");
         Console.ReadKey();
@@ -75,9 +85,10 @@ try
         Console.WriteLine("MENU:");
         Console.WriteLine("1. List all libraries");
         Console.WriteLine("2. Download library by ID");
-        Console.WriteLine("3. Exit");
+        Console.WriteLine("3. Resume interrupted download");
+        Console.WriteLine("4. Exit");
         Console.WriteLine("=====================================");
-        Console.Write("Enter your choice (1-3): ");
+        Console.Write("Enter your choice (1-4): ");
         
         string? choice = Console.ReadLine();
 
@@ -92,13 +103,17 @@ try
                 break;
 
             case "3":
+                await ResumeDownloadAsync(downloadService);
+                break;
+
+            case "4":
                 continueRunning = false;
                 Console.WriteLine("Goodbye!");
                 break;
 
             default:
                 Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine("Invalid choice. Please enter 1, 2, or 3.");
+                Console.WriteLine("Invalid choice. Please enter 1-4.");
                 Console.ResetColor();
                 break;
         }
@@ -305,6 +320,18 @@ async Task DownloadLibraryAsync(LibraryDownloadService service)
         Console.WriteLine($"Failed:          {result.FailedCount:N0}");
         Console.ResetColor();
     }
+    if (result.SkippedCount > 0)
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine($"Skipped:         {result.SkippedCount:N0} (already downloaded)");
+        Console.ResetColor();
+    }
+    if (result.IsResumed)
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine($"Resume Mode:     Yes");
+        Console.ResetColor();
+    }
     Console.WriteLine($"Duration:        {duration:hh\\:mm\\:ss}");
     Console.WriteLine($"Avg Speed:       {(result.SuccessCount / duration.TotalSeconds):F2} files/sec");
     Console.WriteLine($"Message:         {result.Message}");
@@ -319,4 +346,180 @@ async Task DownloadLibraryAsync(LibraryDownloadService service)
     Console.WriteLine("====================");
     Console.WriteLine("\nCheck _download_log.txt in the output folder for details.");
 }
+
+async Task ResumeDownloadAsync(LibraryDownloadService service)
+{
+    Console.WriteLine();
+    Console.WriteLine("Loading incomplete downloads...");
+    
+    var incompleteDownloads = await service.GetIncompleteDownloadsAsync();
+    
+    if (incompleteDownloads.Count == 0)
+    {
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("No incomplete downloads found.");
+        Console.ResetColor();
+        return;
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("Incomplete Downloads:");
+    Console.WriteLine("====================");
+    Console.WriteLine($"{"#",-5} {"Library ID",-12} {"Library Name",-30} {"Progress",-20} {"Last Update",-20}");
+    Console.WriteLine(new string('-', 95));
+    
+    for (int i = 0; i < incompleteDownloads.Count; i++)
+    {
+        var download = incompleteDownloads[i];
+        int completed = download.SuccessfulDocuments.Count;
+        int total = download.TotalDocuments;
+        double percent = total > 0 ? (completed * 100.0 / total) : 0;
+        string progress = $"{completed}/{total} ({percent:F1}%)";
+        
+        Console.WriteLine($"{i + 1,-5} {download.LibraryId,-12} {download.LibraryName,-30} {progress,-20} {download.LastUpdateTime:yyyy-MM-dd HH:mm}");
+    }
+    
+    Console.WriteLine(new string('-', 95));
+    Console.WriteLine($"Total incomplete downloads: {incompleteDownloads.Count}");
+    Console.WriteLine();
+    
+    Console.Write("Enter # to resume (or 0 to cancel): ");
+    string? input = Console.ReadLine();
+
+    if (!int.TryParse(input, out int selection) || selection < 1 || selection > incompleteDownloads.Count)
+    {
+        Console.WriteLine("Cancelled.");
+        return;
+    }
+
+    var selectedDownload = incompleteDownloads[selection - 1];
+    
+    Console.WriteLine();
+    Console.WriteLine("Resume Information:");
+    Console.WriteLine("====================");
+    Console.WriteLine($"Library ID:      {selectedDownload.LibraryId}");
+    Console.WriteLine($"Library Name:    {selectedDownload.LibraryName}");
+    Console.WriteLine($"Total Documents: {selectedDownload.TotalDocuments:N0}");
+    Console.WriteLine($"Completed:       {selectedDownload.SuccessfulDocuments.Count:N0}");
+    Console.WriteLine($"Failed:          {selectedDownload.FailedDocuments.Count:N0}");
+    Console.WriteLine($"Remaining:       {selectedDownload.TotalDocuments - selectedDownload.SuccessfulDocuments.Count:N0}");
+    Console.WriteLine($"Started:         {selectedDownload.StartTime:yyyy-MM-dd HH:mm:ss}");
+    Console.WriteLine($"Last Update:     {selectedDownload.LastUpdateTime:yyyy-MM-dd HH:mm:ss}");
+    Console.WriteLine($"Download Path:   {selectedDownload.DownloadPath}");
+    Console.WriteLine();
+
+    // Ask for parallel download settings
+    Console.Write("Max parallel downloads (1-10, default 4): ");
+    string? parallelInput = Console.ReadLine();
+    int maxParallel = 4;
+    if (int.TryParse(parallelInput, out int p) && p >= 1 && p <= 10)
+    {
+        maxParallel = p;
+    }
+    Console.WriteLine();
+
+    Console.Write("Resume download? (Y/N): ");
+    string? confirm = Console.ReadLine();
+
+    if (confirm?.ToUpper() != "Y")
+    {
+        Console.WriteLine("Resume cancelled.");
+        return;
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("====================");
+    Console.WriteLine("RESUMING DOWNLOAD...");
+    Console.WriteLine($"Max Parallel: {maxParallel}");
+    Console.WriteLine("Press ESC to cancel");
+    Console.WriteLine("====================");
+    Console.WriteLine();
+
+    var startTime = DateTime.Now;
+    var cancellationSource = new CancellationTokenSource();
+    var lastProgressUpdate = DateTime.MinValue;
+    
+    // Start cancellation monitoring task
+    var cancelTask = Task.Run(() =>
+    {
+        while (!cancellationSource.Token.IsCancellationRequested)
+        {
+            if (Console.KeyAvailable && Console.ReadKey(true).Key == ConsoleKey.Escape)
+            {
+                Console.WriteLine("\n\nCancellation requested...");
+                cancellationSource.Cancel();
+                break;
+            }
+            Thread.Sleep(100);
+        }
+    });
+
+    // Progress callback
+    void UpdateProgress(int current, int total)
+    {
+        var now = DateTime.Now;
+        if ((now - lastProgressUpdate).TotalMilliseconds < 1000 && current < total)
+            return;
+        
+        lastProgressUpdate = now;
+        
+        var elapsed = DateTime.Now - startTime;
+        var rate = elapsed.TotalSeconds > 0 ? current / elapsed.TotalSeconds : 0;
+        var eta = rate > 0 && current > 0 ? TimeSpan.FromSeconds((total - current) / rate) : TimeSpan.Zero;
+        var percent = (current * 100.0 / total);
+        
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] Progress: {current:N0}/{total:N0} ({percent:F1}%) | Speed: {rate:F1} files/sec | Elapsed: {elapsed:hh\\:mm\\:ss} | ETA: {eta:hh\\:mm\\:ss}");
+    }
+
+    var result = await service.DownloadLibraryAsync(
+        selectedDownload.LibraryId, 
+        logAction: null,
+        progressAction: UpdateProgress,
+        maxParallelDownloads: maxParallel,
+        cancellationToken: cancellationSource.Token);
+
+    cancellationSource.Cancel();
+    await cancelTask;
+
+    var duration = DateTime.Now - startTime;
+
+    Console.WriteLine("\n\n");
+    Console.WriteLine("====================");
+    Console.WriteLine("RESUME SUMMARY");
+    Console.WriteLine("====================");
+    Console.ForegroundColor = result.IsSuccess ? ConsoleColor.Green : ConsoleColor.Red;
+    Console.WriteLine($"Status:          {(result.IsSuccess ? "? SUCCESS" : "? FAILED")}");
+    Console.ResetColor();
+    Console.WriteLine($"Library:         {result.LibraryName}");
+    Console.WriteLine($"Total Documents: {result.TotalDocuments:N0}");
+    Console.ForegroundColor = ConsoleColor.Green;
+    Console.WriteLine($"Downloaded:      {result.SuccessCount:N0}");
+    Console.ResetColor();
+    if (result.FailedCount > 0)
+    {
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine($"Failed:          {result.FailedCount:N0}");
+        Console.ResetColor();
+    }
+    if (result.SkippedCount > 0)
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine($"Skipped:         {result.SkippedCount:N0} (already downloaded)");
+        Console.ResetColor();
+    }
+    Console.WriteLine($"Resume Duration: {duration:hh\\:mm\\:ss}");
+    Console.WriteLine($"Total Duration:  {DateTime.Now - selectedDownload.StartTime:hh\\:mm\\:ss}");
+    Console.WriteLine($"Message:         {result.Message}");
+    
+    if (!string.IsNullOrEmpty(result.ErrorMessage))
+    {
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine($"Error:           {result.ErrorMessage}");
+        Console.ResetColor();
+    }
+    
+    Console.WriteLine("====================");
+    Console.WriteLine("\nCheck _download_log.txt in the output folder for details.");
+}
+
 

@@ -172,8 +172,51 @@ public class LibraryDownloadService
 
             // Get download path from settings
             string downloadBasePath = GetSettingValue("DownloadPath") ?? _configuration["AppSettings:DownloadPath"] ?? "C:\\Downloads";
-            string libraryPath = Path.Combine(downloadBasePath, $"Library_{libraryId}_{DateTime.Now:yyyyMMdd_HHmmss}");
-            Directory.CreateDirectory(libraryPath);
+            
+            // Check for existing incomplete download to resume
+            string existingFolder = FindLatestDownloadFolder(downloadBasePath, libraryId);
+            DownloadProgress? progress = null;
+            string libraryPath;
+            bool isResume = false;
+
+            if (!string.IsNullOrEmpty(existingFolder))
+            {
+                progress = await LoadProgressAsync(existingFolder, logAction);
+                if (progress != null && !progress.IsCompleted)
+                {
+                    libraryPath = existingFolder;
+                    isResume = true;
+                    result.IsResumed = true;
+                    Log($"*** RESUMING INCOMPLETE DOWNLOAD ***", logAction);
+                    Log($"Found {progress.SuccessfulDocuments.Count} already downloaded documents", logAction);
+                    Log($"Found {progress.FailedDocuments.Count} previously failed documents", logAction);
+                }
+                else
+                {
+                    libraryPath = Path.Combine(downloadBasePath, $"Library_{libraryId}_{DateTime.Now:yyyyMMdd_HHmmss}");
+                    Directory.CreateDirectory(libraryPath);
+                }
+            }
+            else
+            {
+                libraryPath = Path.Combine(downloadBasePath, $"Library_{libraryId}_{DateTime.Now:yyyyMMdd_HHmmss}");
+                Directory.CreateDirectory(libraryPath);
+            }
+
+            // Initialize progress if not resuming
+            if (progress == null)
+            {
+                progress = new DownloadProgress
+                {
+                    LibraryId = libraryId,
+                    LibraryName = library.Name,
+                    DownloadPath = libraryPath,
+                    StartTime = DateTime.Now,
+                    LastUpdateTime = DateTime.Now,
+                    TotalDocuments = library.DocumentCount
+                };
+            }
+
             Log($"Download path: {libraryPath}", logAction);
 
             // Setup for parallel downloads and progress tracking
@@ -181,18 +224,32 @@ public class LibraryDownloadService
             int totalCount = library.DocumentCount;
             int totalPages = (int)Math.Ceiling((double)totalCount / batchSize);
             int processedCount = 0;
-            int successCount = 0;
-            int failedCount = 0;
+            int successCount = progress.SuccessfulDocuments.Count; // Start with already downloaded count
+            int failedCount = progress.FailedDocuments.Count; // Start with previously failed count
+            int skippedCount = 0;
             
             // Create log file for errors
             string logFilePath = Path.Combine(libraryPath, "_download_log.txt");
-            await System.IO.File.WriteAllTextAsync(logFilePath, $"Library Download Log - {DateTime.Now}\n");
-            await System.IO.File.AppendAllTextAsync(logFilePath, $"Library: {library.Name} (ID: {libraryId})\n");
-            await System.IO.File.AppendAllTextAsync(logFilePath, $"Total Documents: {totalCount}\n");
-            await System.IO.File.AppendAllTextAsync(logFilePath, $"Max Parallel Downloads: {maxParallelDownloads}\n\n");
+            if (!isResume)
+            {
+                await System.IO.File.WriteAllTextAsync(logFilePath, $"Library Download Log - {DateTime.Now}\n");
+                await System.IO.File.AppendAllTextAsync(logFilePath, $"Library: {library.Name} (ID: {libraryId})\n");
+                await System.IO.File.AppendAllTextAsync(logFilePath, $"Total Documents: {totalCount}\n");
+                await System.IO.File.AppendAllTextAsync(logFilePath, $"Max Parallel Downloads: {maxParallelDownloads}\n\n");
+            }
+            else
+            {
+                await System.IO.File.AppendAllTextAsync(logFilePath, $"\n\n=== RESUMING DOWNLOAD - {DateTime.Now} ===\n");
+                await System.IO.File.AppendAllTextAsync(logFilePath, $"Previously downloaded: {successCount}\n");
+                await System.IO.File.AppendAllTextAsync(logFilePath, $"Previously failed: {failedCount}\n\n");
+            }
             
             Log($"Processing {totalPages} batches of {batchSize} documents each", logAction);
             Log($"Parallel downloads: {maxParallelDownloads}", logAction);
+            if (isResume)
+            {
+                Log($"Skipping {successCount} already downloaded documents", logAction);
+            }
 
             // Semaphore to control parallel downloads
             using var semaphore = new SemaphoreSlim(maxParallelDownloads, maxParallelDownloads);
@@ -239,6 +296,15 @@ public class LibraryDownloadService
                         if (cancellationToken.IsCancellationRequested)
                             return;
 
+                        // Skip if already successfully downloaded
+                        if (progress!.SuccessfulDocuments.Contains(doc.ID))
+                        {
+                            Interlocked.Increment(ref skippedCount);
+                            int currentProgress = Interlocked.Increment(ref processedCount);
+                            progressAction?.Invoke(currentProgress, totalCount);
+                            return;
+                        }
+
                         // Use pre-loaded document data (no database access needed)
                         bool success = await DownloadDocumentAsync(doc.ID, doc.Name, doc.FileId, doc.IsArchived, doc.PhysicalPath, 
                             libraryPath, isFileStoredOnDB, storagePath, logFilePath, logSemaphore);
@@ -246,15 +312,18 @@ public class LibraryDownloadService
                         if (success)
                         {
                             Interlocked.Increment(ref successCount);
+                            progress.SuccessfulDocuments.Add(doc.ID);
+                            progress.FailedDocuments.Remove(doc.ID);
                         }
                         else
                         {
                             Interlocked.Increment(ref failedCount);
+                            progress.FailedDocuments[doc.ID] = doc.Name ?? "Unknown";
                         }
                         
                         // Update progress
-                        int current = Interlocked.Increment(ref processedCount);
-                        progressAction?.Invoke(current, totalCount);
+                        int currentCount = Interlocked.Increment(ref processedCount);
+                        progressAction?.Invoke(currentCount, totalCount);
                     }
                     catch (OperationCanceledException)
                     {
@@ -263,7 +332,8 @@ public class LibraryDownloadService
                     catch (Exception ex)
                     {
                         Interlocked.Increment(ref failedCount);
-                        await WriteToLogAsync(logFilePath, $"ERROR: Document ID {doc.ID}: {ex.Message}\n", logSemaphore);
+                        progress!.FailedDocuments[doc.ID] = doc.Name ?? "Unknown";
+                        await WriteToLogAsync(logFilePath, $"ERROR: Document ID {doc.ID}, fDocumentId (FileId): {doc.FileId}, Document Name: {doc.Name}\nException: {ex.Message}\nStack Trace: {ex.StackTrace}\n", logSemaphore);
                     }
                     finally
                     {
@@ -272,6 +342,10 @@ public class LibraryDownloadService
                 });
 
                 await Task.WhenAll(downloadTasks);
+
+                // Save progress after each batch
+                progress!.LastUpdateTime = DateTime.Now;
+                await SaveProgressAsync(progress, libraryPath);
 
                 // Periodic garbage collection for large downloads (every 10 batches)
                 if ((pageNo + 1) % 10 == 0)
@@ -285,9 +359,19 @@ public class LibraryDownloadService
             // Update result with final counts
             result.SuccessCount = successCount;
             result.FailedCount = failedCount;
+            result.SkippedCount = skippedCount;
+
+            // Mark progress as completed
+            progress!.IsCompleted = (failedCount == 0);
+            progress.LastUpdateTime = DateTime.Now;
+            await SaveProgressAsync(progress, libraryPath);
 
             result.IsSuccess = true;
-            result.Message = $"Download completed. Success: {result.SuccessCount}, Failed: {result.FailedCount}";
+            result.Message = $"Download completed. Success: {result.SuccessCount}, Failed: {result.FailedCount}, Skipped: {result.SkippedCount}";
+            if (isResume)
+            {
+                result.Message += " (Resumed from previous download)";
+            }
             Log("=== LIBRARY DOWNLOAD COMPLETED ===", logAction);
             Log(result.Message, logAction);
             
@@ -342,7 +426,7 @@ public class LibraryDownloadService
         {
             if (string.IsNullOrEmpty(documentName))
             {
-                await WriteToLogAsync(logFilePath, $"SKIP: Document ID {documentId} has no name\n", logSemaphore);
+                await WriteToLogAsync(logFilePath, $"SKIP: Document ID {documentId}, fDocumentId (FileId): {fileId} has no name\n", logSemaphore);
                 return false;
             }
 
@@ -361,18 +445,18 @@ public class LibraryDownloadService
 
             // Download file
             bool archived = isArchived.HasValue && isArchived.Value == (byte)1;
-            bool success = await ReconstructFileAsync(fileId, documentName, documentDir, archived, isFileStoredOnDB, storagePath, null);
+            bool success = await ReconstructFileAsync(fileId, documentName, documentDir, archived, isFileStoredOnDB, storagePath, null, documentId, logFilePath, logSemaphore);
 
             if (!success)
             {
-                await WriteToLogAsync(logFilePath, $"FAILED: {documentName} (ID: {documentId})\n", logSemaphore);
+                await WriteToLogAsync(logFilePath, $"FAILED: {documentName} (Document ID: {documentId}, fDocumentId (FileId): {fileId})\n", logSemaphore);
             }
 
             return success;
         }
         catch (Exception ex)
         {
-            await WriteToLogAsync(logFilePath, $"ERROR: Document ID {documentId}: {ex.Message}\n", logSemaphore);
+            await WriteToLogAsync(logFilePath, $"ERROR: Document ID {documentId}, fDocumentId (FileId): {fileId}, Document Name: {documentName}\nException: {ex.Message}\nStack Trace: {ex.StackTrace}\n", logSemaphore);
             return false;
         }
     }
@@ -392,7 +476,10 @@ public class LibraryDownloadService
         try
         {
             if (string.IsNullOrEmpty(document.Name))
+            {
+                Log($"SKIP: Document ID {document.ID}, fDocumentId (FileId): {document.FileId} has no name", logAction);
                 return false;
+            }
 
             // Create folder structure
             string relativePath = document.PhysicalPath?.Replace("/", "\\") ?? "";
@@ -410,18 +497,18 @@ public class LibraryDownloadService
 
             // Download file using FileDownloadHandler logic
             bool isArchived = document.IsArchived.HasValue && document.IsArchived.Value == (byte)1;
-            bool success = await ReconstructFileAsync(document.FileId, document.Name, documentDir, isArchived, isFileStoredOnDB, storagePath, logAction);
+            bool success = await ReconstructFileAsync(document.FileId, document.Name, documentDir, isArchived, isFileStoredOnDB, storagePath, logAction, document.ID);
 
             return success;
         }
         catch (Exception ex)
         {
-            Log($"Error in DownloadDocumentAsync: {ex.Message}", logAction);
+            Log($"ERROR in DownloadDocumentAsync: Document ID {document.ID}, fDocumentId (FileId): {document.FileId}, Document Name: {document.Name}\nException: {ex.Message}\nStack Trace: {ex.StackTrace}", logAction);
             return false;
         }
     }
 
-    private async Task<bool> ReconstructFileAsync(int fileId, string fileName, string outputDir, bool isArchived, bool isFileStoredOnDB, string storagePath, Action<string>? logAction)
+    private async Task<bool> ReconstructFileAsync(int fileId, string fileName, string outputDir, bool isArchived, bool isFileStoredOnDB, string storagePath, Action<string>? logAction, int documentId = 0, string? logFilePath = null, SemaphoreSlim? logSemaphore = null)
     {
         try
         {
@@ -446,15 +533,33 @@ public class LibraryDownloadService
 
                         if (chunkData == null)
                         {
-                            Log($"Chunk {chunkIndex} not found", logAction);
+                            string errorMsg = $"Chunk {chunkIndex} not found for fDocumentId (FileId): {fileId}, Document ID: {documentId}, File: {fileName}";
+                            Log(errorMsg, logAction);
+                            if (logFilePath != null && logSemaphore != null)
+                            {
+                                await WriteToLogAsync(logFilePath, $"ERROR: {errorMsg}\n", logSemaphore);
+                            }
                             return false;
                         }
 
                         // Write chunk
                         FileMode mode = (i == 1) ? FileMode.Create : FileMode.Append;
-                        using (var fs = new FileStream(outputFilePath, mode))
+                        try
                         {
-                            await fs.WriteAsync(chunkData, 0, chunkData.Length);
+                            using (var fs = new FileStream(outputFilePath, mode))
+                            {
+                                await fs.WriteAsync(chunkData, 0, chunkData.Length);
+                            }
+                        }
+                        catch (Exception chunkEx)
+                        {
+                            string errorMsg = $"Failed to write chunk {chunkIndex} for fDocumentId (FileId): {fileId}, Document ID: {documentId}, File: {fileName}\nException: {chunkEx.Message}";
+                            Log(errorMsg, logAction);
+                            if (logFilePath != null && logSemaphore != null)
+                            {
+                                await WriteToLogAsync(logFilePath, $"ERROR: {errorMsg}\n", logSemaphore);
+                            }
+                            throw;
                         }
                     }
 
@@ -466,13 +571,31 @@ public class LibraryDownloadService
                     var fileData = await GetFileHashValueAsync(fileId);
                     if (fileData == null || fileData.Length == 0)
                     {
-                        Log("File HashValue not found or empty", logAction);
+                        string errorMsg = $"File HashValue not found or empty for fDocumentId (FileId): {fileId}, Document ID: {documentId}, File: {fileName}";
+                        Log(errorMsg, logAction);
+                        if (logFilePath != null && logSemaphore != null)
+                        {
+                            await WriteToLogAsync(logFilePath, $"ERROR: {errorMsg}\n", logSemaphore);
+                        }
                         return false;
                     }
 
-                    using (var fs = new FileStream(outputFilePath, FileMode.Create))
+                    try
                     {
-                        await fs.WriteAsync(fileData, 0, fileData.Length);
+                        using (var fs = new FileStream(outputFilePath, FileMode.Create))
+                        {
+                            await fs.WriteAsync(fileData, 0, fileData.Length);
+                        }
+                    }
+                    catch (Exception writeEx)
+                    {
+                        string errorMsg = $"Failed to write file for fDocumentId (FileId): {fileId}, Document ID: {documentId}, File: {fileName}\nException: {writeEx.Message}";
+                        Log(errorMsg, logAction);
+                        if (logFilePath != null && logSemaphore != null)
+                        {
+                            await WriteToLogAsync(logFilePath, $"ERROR: {errorMsg}\n", logSemaphore);
+                        }
+                        throw;
                     }
 
                     return true;
@@ -488,11 +611,32 @@ public class LibraryDownloadService
                     // Fallback to database
                     var fileData = await GetFileHashValueAsync(fileId);
                     if (fileData == null || fileData.Length == 0)
-                        return false;
-
-                    using (var fs = new FileStream(outputFilePath, FileMode.Create))
                     {
-                        await fs.WriteAsync(fileData, 0, fileData.Length);
+                        string errorMsg = $"File not found in file system and database fallback failed for fDocumentId (FileId): {fileId}, Document ID: {documentId}, File: {fileName}";
+                        Log(errorMsg, logAction);
+                        if (logFilePath != null && logSemaphore != null)
+                        {
+                            await WriteToLogAsync(logFilePath, $"ERROR: {errorMsg}\n", logSemaphore);
+                        }
+                        return false;
+                    }
+
+                    try
+                    {
+                        using (var fs = new FileStream(outputFilePath, FileMode.Create))
+                        {
+                            await fs.WriteAsync(fileData, 0, fileData.Length);
+                        }
+                    }
+                    catch (Exception writeEx)
+                    {
+                        string errorMsg = $"Failed to write file from database fallback for fDocumentId (FileId): {fileId}, Document ID: {documentId}, File: {fileName}\nException: {writeEx.Message}";
+                        Log(errorMsg, logAction);
+                        if (logFilePath != null && logSemaphore != null)
+                        {
+                            await WriteToLogAsync(logFilePath, $"ERROR: {errorMsg}\n", logSemaphore);
+                        }
+                        throw;
                     }
 
                     return true;
@@ -500,33 +644,51 @@ public class LibraryDownloadService
                 else
                 {
                     // Read from file system
-                    var chunkFiles = Directory.GetFiles(fileContentPath)
-                        .OrderBy(f => 
-                        {
-                            // Sort by chunk number: 1.tmp, 2.tmp, ..., -1.tmp (last)
-                            var fileName = Path.GetFileNameWithoutExtension(f);
-                            return fileName == "-1" ? int.MaxValue : int.Parse(fileName);
-                        })
-                        .ToList();
-
-                    for (int i = 0; i < chunkFiles.Count; i++)
+                    try
                     {
-                        byte[] data = await System.IO.File.ReadAllBytesAsync(chunkFiles[i]);
-                        FileMode mode = (i == 0) ? FileMode.Create : FileMode.Append;
+                        var chunkFiles = Directory.GetFiles(fileContentPath)
+                            .OrderBy(f => 
+                            {
+                                // Sort by chunk number: 1.tmp, 2.tmp, ..., -1.tmp (last)
+                                var fileName = Path.GetFileNameWithoutExtension(f);
+                                return fileName == "-1" ? int.MaxValue : int.Parse(fileName);
+                            })
+                            .ToList();
 
-                        using (var fs = new FileStream(outputFilePath, mode))
+                        for (int i = 0; i < chunkFiles.Count; i++)
                         {
-                            await fs.WriteAsync(data, 0, data.Length);
-                        }
-                    }
+                            byte[] data = await System.IO.File.ReadAllBytesAsync(chunkFiles[i]);
+                            FileMode mode = (i == 0) ? FileMode.Create : FileMode.Append;
 
-                    return true;
+                            using (var fs = new FileStream(outputFilePath, mode))
+                            {
+                                await fs.WriteAsync(data, 0, data.Length);
+                            }
+                        }
+
+                        return true;
+                    }
+                    catch (Exception fsEx)
+                    {
+                        string errorMsg = $"Failed to read/write file from file system for fDocumentId (FileId): {fileId}, Document ID: {documentId}, File: {fileName}\nPath: {fileContentPath}\nException: {fsEx.Message}";
+                        Log(errorMsg, logAction);
+                        if (logFilePath != null && logSemaphore != null)
+                        {
+                            await WriteToLogAsync(logFilePath, $"ERROR: {errorMsg}\n", logSemaphore);
+                        }
+                        throw;
+                    }
                 }
             }
         }
         catch (Exception ex)
         {
-            Log($"Error reconstructing file: {ex.Message}", logAction);
+            string errorMsg = $"Error reconstructing file for fDocumentId (FileId): {fileId}, Document ID: {documentId}, File: {fileName}\nException: {ex.Message}\nStack Trace: {ex.StackTrace}";
+            Log(errorMsg, logAction);
+            if (logFilePath != null && logSemaphore != null)
+            {
+                await WriteToLogAsync(logFilePath, $"ERROR: {errorMsg}\n", logSemaphore);
+            }
             return false;
         }
     }
@@ -622,6 +784,131 @@ public class LibraryDownloadService
         Console.WriteLine(logMessage);
         logAction?.Invoke(logMessage);
     }
+
+    /// <summary>
+    /// Saves download progress to a JSON file
+    /// </summary>
+    private async Task SaveProgressAsync(DownloadProgress progress, string libraryPath)
+    {
+        try
+        {
+            string progressFile = Path.Combine(libraryPath, "_download_progress.json");
+            string json = System.Text.Json.JsonSerializer.Serialize(progress, new System.Text.Json.JsonSerializerOptions 
+            { 
+                WriteIndented = true 
+            });
+            await System.IO.File.WriteAllTextAsync(progressFile, json);
+        }
+        catch (Exception)
+        {
+            // Silently fail - progress tracking shouldn't break the download
+        }
+    }
+
+    /// <summary>
+    /// Loads download progress from a JSON file
+    /// </summary>
+    private async Task<DownloadProgress?> LoadProgressAsync(string libraryPath, Action<string>? logAction)
+    {
+        try
+        {
+            string progressFile = Path.Combine(libraryPath, "_download_progress.json");
+            if (!System.IO.File.Exists(progressFile))
+                return null;
+
+            string json = await System.IO.File.ReadAllTextAsync(progressFile);
+            var progress = System.Text.Json.JsonSerializer.Deserialize<DownloadProgress>(json);
+            
+            if (progress != null)
+            {
+                Log($"Loaded progress file: {progress.SuccessfulDocuments.Count} successful, {progress.FailedDocuments.Count} failed", logAction);
+            }
+            
+            return progress;
+        }
+        catch (Exception ex)
+        {
+            Log($"Warning: Could not load progress file: {ex.Message}", logAction);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Finds the most recent download folder for a library
+    /// </summary>
+    private string FindLatestDownloadFolder(string downloadBasePath, int libraryId)
+    {
+        try
+        {
+            if (!Directory.Exists(downloadBasePath))
+                return string.Empty;
+
+            var folders = Directory.GetDirectories(downloadBasePath, $"Library_{libraryId}_*")
+                .OrderByDescending(f => Directory.GetCreationTime(f))
+                .ToList();
+
+            foreach (var folder in folders)
+            {
+                string progressFile = Path.Combine(folder, "_download_progress.json");
+                if (System.IO.File.Exists(progressFile))
+                {
+                    return folder;
+                }
+            }
+
+            return string.Empty;
+        }
+        catch (Exception)
+        {
+            return string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Gets a list of incomplete downloads that can be resumed
+    /// </summary>
+    public async Task<List<DownloadProgress>> GetIncompleteDownloadsAsync(string? downloadBasePath = null)
+    {
+        var incompleteDownloads = new List<DownloadProgress>();
+        
+        try
+        {
+            downloadBasePath ??= GetSettingValue("DownloadPath") ?? _configuration["AppSettings:DownloadPath"] ?? "C:\\Downloads";
+            
+            if (!Directory.Exists(downloadBasePath))
+                return incompleteDownloads;
+
+            var folders = Directory.GetDirectories(downloadBasePath, "Library_*");
+            
+            foreach (var folder in folders)
+            {
+                string progressFile = Path.Combine(folder, "_download_progress.json");
+                if (System.IO.File.Exists(progressFile))
+                {
+                    try
+                    {
+                        string json = await System.IO.File.ReadAllTextAsync(progressFile);
+                        var progress = System.Text.Json.JsonSerializer.Deserialize<DownloadProgress>(json);
+                        
+                        if (progress != null && !progress.IsCompleted)
+                        {
+                            incompleteDownloads.Add(progress);
+                        }
+                    }
+                    catch
+                    {
+                        // Skip corrupted progress files
+                    }
+                }
+            }
+
+            return incompleteDownloads.OrderByDescending(p => p.LastUpdateTime).ToList();
+        }
+        catch (Exception)
+        {
+            return incompleteDownloads;
+        }
+    }
 }
 
 public class LibraryInfo
@@ -640,8 +927,23 @@ public class DownloadResult
     public int TotalDocuments { get; set; }
     public int SuccessCount { get; set; }
     public int FailedCount { get; set; }
+    public int SkippedCount { get; set; }
     public string Message { get; set; } = "";
     public string ErrorMessage { get; set; } = "";
+    public bool IsResumed { get; set; }
+}
+
+public class DownloadProgress
+{
+    public int LibraryId { get; set; }
+    public string LibraryName { get; set; } = "";
+    public string DownloadPath { get; set; } = "";
+    public DateTime StartTime { get; set; }
+    public DateTime LastUpdateTime { get; set; }
+    public int TotalDocuments { get; set; }
+    public HashSet<int> SuccessfulDocuments { get; set; } = new HashSet<int>();
+    public Dictionary<int, string> FailedDocuments { get; set; } = new Dictionary<int, string>();
+    public bool IsCompleted { get; set; }
 }
 
 public class ConnectionTestResult

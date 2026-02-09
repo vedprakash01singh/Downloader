@@ -48,6 +48,9 @@ _ReSharper*/
 .DS_Store
 .DS_Store?
 ._*
+
+# Sensitive configuration files - Connection strings and secrets
+secrets.json
 .Spotlight-V100
 .Trashes
 ehthumbs.db
